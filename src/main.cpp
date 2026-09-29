@@ -46,7 +46,6 @@
 #include <esp_heap_caps.h>
 #include <esp32-hal-psram.h>
 #include <esp_partition.h>
-#include <esp_spi_flash.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -61,9 +60,7 @@
 // image during boot and lets the ESP32 map the ROM directly from Flash.
 // ============================================================================
 
-static const uint8_t *rom_start = nullptr;
 static const esp_partition_t *rom_partition = nullptr;
-static spi_flash_mmap_handle_t rom_mmap_handle = 0;
 
 
 // ============================================================================
@@ -420,47 +417,34 @@ static bool initialise_rom()
         return false;
     }
 
-    const void *mapped = nullptr;
+    uint8_t header[32] = {};
 
-    const esp_err_t err = esp_partition_mmap(
+    const esp_err_t err = esp_partition_read(
         rom_partition,
         0,
-        EXPECTED_ROM_SIZE,
-        SPI_FLASH_MMAP_DATA,
-        &mapped,
-        &rom_mmap_handle
+        header,
+        sizeof(header)
     );
 
-    if (err != ESP_OK || mapped == nullptr)
+    if (err != ESP_OK)
     {
         Serial.printf(
-            "[ROM] esp_partition_mmap failed: %d\n",
+            "[ROM] partition read failed: %d\n",
             static_cast<int>(err)
         );
 
         fatal_error(
-            "Could not memory-map P's ROM."
+            "Could not read P's ROM partition."
         );
 
         return false;
     }
 
-    rom_start =
-        static_cast<const uint8_t *>(
-            mapped
-        );
-
-    Serial.printf(
-        "[ROM] mapped at        : %p\n",
-        rom_start
-    );
-
-    // Quick sanity check. An erased partition starts with 0xFF bytes.
     bool looks_erased = true;
 
-    for (size_t i = 0; i < 32; ++i)
+    for (size_t i = 0; i < sizeof(header); ++i)
     {
-        if (rom_start[i] != 0xFF)
+        if (header[i] != 0xFF)
         {
             looks_erased = false;
             break;
@@ -477,7 +461,7 @@ static bool initialise_rom()
     }
 
     Serial.println(
-        "[ROM] raw Flash mapping ready"
+        "[ROM] raw Flash partition ready; PSRAM cache will load pages on demand"
     );
 
     return true;
@@ -914,10 +898,8 @@ static bool initialise_emulator()
     //
     //     uint8_t *rom;
     //
-    // rom_start points to the dedicated 8 MiB tamarom Flash partition.
-    //
-    // Reads performed by mem_read8/16/32 are valid directly against this
-    // memory-mapped address.
+    // The 8 MiB ROM lives in the dedicated tamarom Flash partition.
+    // mem.c loads 64 KiB pages into a 2 MiB PSRAM cache on demand.
     //
     // IMPORTANT:
     // Do not allow original TamaEmu flash_write() to directly modify this
@@ -926,10 +908,10 @@ static bool initialise_emulator()
     // A sparse sector overlay will be added to mem.c for persistent saves.
     // ------------------------------------------------------------------------
 
+    // ROM reads are served by tamaemu/mem.c from the dedicated tamarom
+    // partition through a 2 MiB PSRAM page cache.
     emu->rom =
-        const_cast<uint8_t *>(
-            rom_start
-        );
+        nullptr;
 
 
     emu->cmu.osc3_hz =
