@@ -1,6 +1,9 @@
 name: Build ESP-TamaCore
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
