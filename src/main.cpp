@@ -45,29 +45,24 @@
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
 #include <esp32-hal-psram.h>
+#include <esp_partition.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 
 // ============================================================================
-// Embedded ROM
+// P's ROM raw Flash partition
 // ============================================================================
 //
-// Required exact symbols for:
-//
-//     board_build.embed_txtfiles = ps.bin
-//
-// IMPORTANT:
-// The repository file must actually be named:
-//
-//     ps.bin
-//
-// not ps.BIN when compiling on Linux / GitHub Actions.
+// The 8 MiB ROM is flashed separately into the "tamarom" partition at
+// 0x310000. Keeping it outside firmware.bin avoids an 8+ MiB application
+// image during boot and lets the ESP32 map the ROM directly from Flash.
 // ============================================================================
 
-extern const uint8_t rom_start[] asm("_binary_ps_bin_start");
-extern const uint8_t rom_end[]   asm("_binary_ps_bin_end");
+static const uint8_t *rom_start = nullptr;
+static const esp_partition_t *rom_partition = nullptr;
+static esp_partition_mmap_handle_t rom_mmap_handle = 0;
 
 
 // ============================================================================
@@ -388,62 +383,100 @@ static bool initialise_psram()
 
 static bool initialise_rom()
 {
-    const size_t embedded_size =
-        static_cast<size_t>(rom_end - rom_start);
+    Serial.println("[ROM] locating raw tamarom partition...");
 
-    Serial.printf(
-        "[ROM] start    : %p\n",
-        rom_start
+    rom_partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        static_cast<esp_partition_subtype_t>(0x40),
+        "tamarom"
     );
 
-    Serial.printf(
-        "[ROM] end      : %p\n",
-        rom_end
-    );
-
-    Serial.printf(
-        "[ROM] embedded : %u bytes\n",
-        static_cast<unsigned>(embedded_size)
-    );
-
-    Serial.printf(
-        "[ROM] expected : %u bytes\n",
-        static_cast<unsigned>(EXPECTED_ROM_SIZE)
-    );
-
-
-    // embed_txtfiles adds a terminating zero byte.
-    //
-    // Therefore:
-    //
-    // binary file     = 8,388,608 bytes
-    // embedded span   = normally 8,388,609 bytes
-    //
-    // We intentionally use only the first 8 MiB.
-
-    if (embedded_size < EXPECTED_ROM_SIZE)
+    if (rom_partition == nullptr)
     {
         fatal_error(
-            "Embedded ps.bin is smaller than the 8 MB P's ROM."
+            "Raw tamarom partition was not found."
         );
 
         return false;
     }
 
+    Serial.printf(
+        "[ROM] partition offset : 0x%08X\n",
+        static_cast<unsigned>(rom_partition->address)
+    );
 
-    if (embedded_size > EXPECTED_ROM_SIZE)
+    Serial.printf(
+        "[ROM] partition size   : %u bytes\n",
+        static_cast<unsigned>(rom_partition->size)
+    );
+
+    if (rom_partition->size < EXPECTED_ROM_SIZE)
     {
-        Serial.printf(
-            "[ROM] ignoring %u trailing embedded byte(s)\n",
-            static_cast<unsigned>(
-                embedded_size - EXPECTED_ROM_SIZE
-            )
+        fatal_error(
+            "tamarom partition is smaller than 8 MB."
         );
+
+        return false;
     }
 
+    const void *mapped = nullptr;
+
+    const esp_err_t err = esp_partition_mmap(
+        rom_partition,
+        0,
+        EXPECTED_ROM_SIZE,
+        ESP_PARTITION_MMAP_DATA,
+        &mapped,
+        &rom_mmap_handle
+    );
+
+    if (err != ESP_OK || mapped == nullptr)
+    {
+        Serial.printf(
+            "[ROM] esp_partition_mmap failed: %d\n",
+            static_cast<int>(err)
+        );
+
+        fatal_error(
+            "Could not memory-map P's ROM."
+        );
+
+        return false;
+    }
+
+    rom_start =
+        static_cast<const uint8_t *>(
+            mapped
+        );
+
+    Serial.printf(
+        "[ROM] mapped at        : %p\n",
+        rom_start
+    );
+
+    // Quick sanity check. An erased partition starts with 0xFF bytes.
+    bool looks_erased = true;
+
+    for (size_t i = 0; i < 32; ++i)
+    {
+        if (rom_start[i] != 0xFF)
+        {
+            looks_erased = false;
+            break;
+        }
+    }
+
+    if (looks_erased)
+    {
+        fatal_error(
+            "tamarom partition appears erased; ps.bin was not flashed."
+        );
+
+        return false;
+    }
 
     Serial.println(
-        "[ROM] using memory-mapped Flash directly"
+        "[ROM] raw Flash mapping ready"
     );
 
     return true;
@@ -880,7 +913,7 @@ static bool initialise_emulator()
     //
     //     uint8_t *rom;
     //
-    // The embedded ESP32 image is const because it is located in Flash.
+    // rom_start points to the dedicated 8 MiB tamarom Flash partition.
     //
     // Reads performed by mem_read8/16/32 are valid directly against this
     // memory-mapped address.
@@ -1366,6 +1399,10 @@ void setup()
 
     Serial.println(
         " TamaEmu S1C33 native frontend"
+    );
+
+    Serial.println(
+        " ROM source: raw Flash partition"
     );
 
     Serial.println(
