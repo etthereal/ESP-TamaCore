@@ -46,6 +46,9 @@
 #include <esp_heap_caps.h>
 #include <esp32-hal-psram.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 
 // ============================================================================
 // Embedded ROM
@@ -451,9 +454,10 @@ static bool initialise_rom()
 // Display
 // ============================================================================
 
-static void initialise_display()
+static void initialise_display_hardware()
 {
-    // GPIO20 controls the Waveshare board backlight.
+    // Bring the LCD up before Serial, PSRAM, ROM validation or emulator state.
+    // This gives us a visible diagnostic surface even if later init fails.
 
     pinMode(
         BOARD_LCD_BL,
@@ -465,11 +469,24 @@ static void initialise_display()
         HIGH
     );
 
-
     tft.init();
-
     tft.setRotation(0);
 
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    tft.drawString(
+        "LCD OK",
+        BOARD_LCD_WIDTH / 2,
+        BOARD_LCD_HEIGHT / 2,
+        2
+    );
+}
+
+
+static void show_startup_screen()
+{
     tft.fillScreen(TFT_BLACK);
 
     tft.setTextDatum(MC_DATUM);
@@ -478,7 +495,6 @@ static void initialise_display()
         TFT_WHITE,
         TFT_BLACK
     );
-
 
     tft.drawString(
         "ESP-TamaCore",
@@ -493,7 +509,6 @@ static void initialise_display()
         BOARD_LCD_HEIGHT / 2 + 16,
         2
     );
-
 
     Serial.println(
         "[LCD] ST7789 initialised"
@@ -1177,6 +1192,14 @@ static void run_emulator_1x()
 
 
         ++executed_steps;
+
+
+        // Diagnostic watchdog-safe build:
+        // yield one FreeRTOS tick after each simulated CPU step so the
+        // Arduino loop task cannot starve the RTOS/watchdog.
+        //
+        // This intentionally sacrifices emulation speed for stability.
+        vTaskDelay(1);
     }
 
 
@@ -1313,13 +1336,18 @@ static void update_performance_monitor()
 
 void setup()
 {
+    // FIRST: initialise the physical display before anything that can fail.
+    initialise_display_hardware();
+
+
     Serial.begin(
         115200
     );
 
 
+    // Short diagnostic pause only after the LCD is already alive.
     delay(
-        250
+        50
     );
 
 
@@ -1345,7 +1373,7 @@ void setup()
     );
 
 
-    initialise_display();
+    show_startup_screen();
 
 
     if (!initialise_psram())
@@ -1441,6 +1469,8 @@ void loop()
     update_performance_monitor();
 
 
-    // ESP32 Arduino's loop task regains control after this function returns.
-    // No delay is intentionally inserted here.
+    // Second watchdog safety net. The CPU interpreter already yields inside
+    // run_emulator_1x(), but this guarantees FreeRTOS also gets time between
+    // complete Arduino loop passes.
+    vTaskDelay(1);
 }
