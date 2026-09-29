@@ -1352,19 +1352,23 @@ static void update_performance_monitor()
 
 void setup()
 {
-    // FIRST: initialise the physical display before anything that can fail.
-    initialise_display_hardware();
-
-
+    // Serial first for crash diagnostics. The previous build proved that
+    // TFT_eSPI::init() itself can fault before any visible LCD output.
     Serial.begin(
         115200
     );
 
-
-    // Short diagnostic pause only after the LCD is already alive.
     delay(
         50
     );
+
+    Serial.println();
+    Serial.println("[BOOT] Arduino setup entered");
+    Serial.println("[BOOT] Initialising ST7789 on HSPI/SPI3...");
+
+    initialise_display_hardware();
+
+    Serial.println("[BOOT] TFT initialisation returned successfully");
 
 
     Serial.println();
