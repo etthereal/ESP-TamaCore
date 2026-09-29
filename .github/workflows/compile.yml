@@ -43,7 +43,21 @@ jobs:
           set -euo pipefail
           BUILD=".pio/build/esp32-s3-devkitc-1"
           ESPTOOL="$HOME/.platformio/packages/tool-esptoolpy/esptool.py"
-          python "$ESPTOOL" --chip esp32s3 merge_bin             -o "$BUILD/esp-tamacore-full.bin"             --flash_mode qio             --flash_freq 80m             --flash_size 16MB             0x0 "$BUILD/bootloader.bin"             0x8000 "$BUILD/partitions.bin"             0x10000 "$BUILD/firmware.bin"
+          BOOT_APP0="$(find "$HOME/.platformio/packages/framework-arduinoespressif32" -name boot_app0.bin -print -quit)"
+          test -n "$BOOT_APP0"
+
+          # Match PlatformIO/Arduino's ESP32-S3 flash-mode handling.
+          # The board config may say qio, but PlatformIO emits DIO for Arduino.
+          python "$ESPTOOL" --chip esp32s3 merge_bin \
+            -o "$BUILD/esp-tamacore-full.bin" \
+            --flash_mode dio \
+            --flash_freq 80m \
+            --flash_size 16MB \
+            0x0 "$BUILD/bootloader.bin" \
+            0x8000 "$BUILD/partitions.bin" \
+            0xe000 "$BOOT_APP0" \
+            0x10000 "$BUILD/firmware.bin" \
+            0x310000 ps.bin
 
       - name: Upload firmware binaries
         uses: actions/upload-artifact@v4
