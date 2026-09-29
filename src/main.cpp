@@ -46,6 +46,7 @@
 #include <esp_heap_caps.h>
 #include <esp32-hal-psram.h>
 #include <esp_partition.h>
+#include <esp_spi_flash.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -62,7 +63,7 @@
 
 static const uint8_t *rom_start = nullptr;
 static const esp_partition_t *rom_partition = nullptr;
-static esp_partition_mmap_handle_t rom_mmap_handle = 0;
+static spi_flash_mmap_handle_t rom_mmap_handle = 0;
 
 
 // ============================================================================
@@ -425,7 +426,7 @@ static bool initialise_rom()
         rom_partition,
         0,
         EXPECTED_ROM_SIZE,
-        ESP_PARTITION_MMAP_DATA,
+        SPI_FLASH_MMAP_DATA,
         &mapped,
         &rom_mmap_handle
     );
