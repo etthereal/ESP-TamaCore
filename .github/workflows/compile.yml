@@ -37,6 +37,15 @@ jobs:
       - name: Build firmware
         run: pio run -e esp32-s3-devkitc-1
 
+      - name: Symbolicate crash addresses
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD=".pio/build/esp32-s3-devkitc-1"
+          ADDR2LINE="$HOME/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-addr2line"
+          "$ADDR2LINE" -pfiaC -e "$BUILD/firmware.elf" \
+            0x42008931 0x420089fd 0x420021cd 0x4200b3e2
+
       - name: Create full flash image
         shell: bash
         run: |
@@ -69,3 +78,5 @@ jobs:
             .pio/build/esp32-s3-devkitc-1/firmware.bin
             .pio/build/esp32-s3-devkitc-1/bootloader.bin
             .pio/build/esp32-s3-devkitc-1/partitions.bin
+            .pio/build/esp32-s3-devkitc-1/firmware.elf
+            .pio/build/esp32-s3-devkitc-1/firmware.map
