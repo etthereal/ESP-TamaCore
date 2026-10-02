@@ -1210,12 +1210,13 @@ static void run_emulator_1x()
         ++executed_steps;
 
 
-        // Diagnostic watchdog-safe build:
-        // yield one FreeRTOS tick after each simulated CPU step so the
-        // Arduino loop task cannot starve the RTOS/watchdog.
-        //
-        // This intentionally sacrifices emulation speed for stability.
-        vTaskDelay(1);
+        // The CPU interpreter is the hot path. A 1-tick delay here
+        // would insert roughly 1 ms of real time after EVERY emulated
+        // instruction, making an 18.4 MHz target run at a tiny fraction
+        // of real time. Yield only periodically; one 20k-step batch is
+        // still bounded by the scheduler and watchdog.
+        if ((executed_steps & 0x3FFu) == 0u)
+            taskYIELD();
     }
 
 
