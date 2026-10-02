@@ -563,6 +563,8 @@ void lcd_render(Emu *e, uint32_t *out, int *w, int *h); /* RGBA8888, MADCTL appl
 int lcd_dump_bmp(Emu *e, const char *path);
 void lcd_report(Emu *e, FILE *f);  /* gamma/power MATCH table vs iD expected */
 
+bool mem_rom_prepare(Emu *e);
+
 void mem_io_log_touch(Emu *e, uint32_t a, int write, uint32_t v, int size);
 
 /* link.c */
