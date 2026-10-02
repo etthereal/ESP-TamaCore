@@ -461,7 +461,7 @@ static bool initialise_rom()
     }
 
     Serial.println(
-        "[ROM] raw Flash partition ready; PSRAM cache will load pages on demand"
+        "[ROM] raw Flash partition ready"
     );
 
     return true;
@@ -908,10 +908,20 @@ static bool initialise_emulator()
     // A sparse sector overlay will be added to mem.c for persistent saves.
     // ------------------------------------------------------------------------
 
-    // ROM reads are served by tamaemu/mem.c from the dedicated tamarom
-    // partition through a 2 MiB PSRAM page cache.
-    emu->rom =
-        nullptr;
+    // ROM is now resident in PSRAM; mem.c keeps only sparse COW save sectors.
+    // Load the complete 8 MiB ROM into PSRAM before the CPU starts.
+    // This removes Flash/partition reads from the CPU hot path.
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Cargando ROM...", BOARD_LCD_WIDTH / 2, BOARD_LCD_HEIGHT / 2, 2);
+    Serial.println("[ROM] Cargando ROM completa a PSRAM...");
+    if (!mem_rom_prepare(emu)) {
+        fatal_error("Could not load complete ROM into PSRAM.");
+        return false;
+    }
+    Serial.printf("[ROM] Full ROM loaded: %u bytes in PSRAM\\n", (unsigned)emu->dev.rom_size);
+    Serial.printf("[PSRAM] free after ROM load: %u bytes\\n", (unsigned)ESP.getFreePsram());
 
 
     emu->cmu.osc3_hz =
