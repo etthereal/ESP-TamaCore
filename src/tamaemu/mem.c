@@ -11,6 +11,10 @@
 #define ROM_CACHE_PAGE_SIZE 0x10000u
 #define ROM_CACHE_SLOTS 32u
 
+/* Full 8 MiB P's NOR image loaded once into OPI PSRAM at boot. */
+static uint8_t *rom_psram;
+static bool rom_psram_ready;
+
 static uint8_t *rom_overlay[ROM_OVERLAY_MAX_SECTORS];
 static uint32_t rom_overlay_count;
 static bool rom_chip_erased;
@@ -20,11 +24,10 @@ static uint8_t *rom_cache_data[ROM_CACHE_SLOTS];
 static uint16_t rom_cache_tag[ROM_CACHE_SLOTS];
 static bool rom_cache_valid[ROM_CACHE_SLOTS];
 
-static uint8_t *rom_cache_page(Emu *e, uint32_t off)
+bool mem_rom_prepare(Emu *e)
 {
-    off &= (e->dev.rom_size - 1u);
-    uint32_t page = off / ROM_CACHE_PAGE_SIZE;
-    uint32_t slot = page & (ROM_CACHE_SLOTS - 1u);
+    if (rom_psram_ready && rom_psram) return true;
+    if (!e || e->dev.rom_size == 0) return false;
 
     if (!rom_partition) {
         rom_partition = esp_partition_find_first(
@@ -32,83 +35,69 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
             (esp_partition_subtype_t)0x40,
             "tamarom"
         );
-
         if (!rom_partition) {
             e->stopped = true;
             snprintf(e->stop_reason, sizeof e->stop_reason,
                      "tamarom partition not found");
-            return NULL;
+            return false;
         }
     }
 
-    if (!rom_cache_data[slot]) {
-        rom_cache_data[slot] = (uint8_t *)ps_malloc(ROM_CACHE_PAGE_SIZE);
-        if (!rom_cache_data[slot]) {
-            e->stopped = true;
-            snprintf(e->stop_reason, sizeof e->stop_reason,
-                     "PSRAM exhausted allocating ROM cache slot %u",
-                     (unsigned)slot);
-            return NULL;
-        }
-        rom_cache_valid[slot] = false;
+    if (rom_partition->size < e->dev.rom_size) {
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "tamarom partition too small: %u < %u",
+                 (unsigned)rom_partition->size, (unsigned)e->dev.rom_size);
+        return false;
     }
 
-    if (!rom_cache_valid[slot] || rom_cache_tag[slot] != page) {
-        esp_err_t err = esp_partition_read(
-            rom_partition,
-            page * ROM_CACHE_PAGE_SIZE,
-            rom_cache_data[slot],
-            ROM_CACHE_PAGE_SIZE
-        );
-
-        if (err != ESP_OK) {
-            e->stopped = true;
-            snprintf(e->stop_reason, sizeof e->stop_reason,
-                     "ROM cache read failed page %u err=%d",
-                     (unsigned)page, (int)err);
-            return NULL;
-        }
-
-        rom_cache_tag[slot] = (uint16_t)page;
-        rom_cache_valid[slot] = true;
+    rom_psram = (uint8_t *)ps_malloc(e->dev.rom_size);
+    if (!rom_psram) {
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "PSRAM allocation failed for %u-byte ROM",
+                 (unsigned)e->dev.rom_size);
+        return false;
     }
 
-    return rom_cache_data[slot];
+    esp_err_t err = esp_partition_read(
+        rom_partition, 0, rom_psram, e->dev.rom_size);
+    if (err != ESP_OK) {
+        free(rom_psram);
+        rom_psram = NULL;
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "full ROM load failed err=%d", (int)err);
+        return false;
+    }
+
+    rom_psram_ready = true;
+    e->rom = rom_psram;
+    return true;
 }
 
 static inline uint8_t rom_read_byte(Emu *e, uint32_t off)
 {
     off &= (e->dev.rom_size - 1u);
-
     uint32_t sec = off / ROM_OVERLAY_SECTOR_SIZE;
     if (sec < ROM_OVERLAY_MAX_SECTORS && rom_overlay[sec])
         return rom_overlay[sec][off & (ROM_OVERLAY_SECTOR_SIZE - 1u)];
-
-    if (rom_chip_erased)
-        return 0xFFu;
-
-    uint8_t *page = rom_cache_page(e, off);
-    if (!page)
-        return 0xFFu;
-
-    return page[off & (ROM_CACHE_PAGE_SIZE - 1u)];
+    if (rom_chip_erased) return 0xFFu;
+    if (!rom_psram_ready || !rom_psram) return 0xFFu;
+    return rom_psram[off];
 }
 
 static inline uint16_t rom_read16_cached(Emu *e, uint32_t off)
 {
     off &= (e->dev.rom_size - 1u);
-    uint32_t sec = off / ROM_OVERLAY_SECTOR_SIZE;
-    uint32_t in = off & (ROM_CACHE_PAGE_SIZE - 1u);
-
-    if (!rom_chip_erased &&
-        sec < ROM_OVERLAY_MAX_SECTORS &&
-        !rom_overlay[sec] &&
-        in <= ROM_CACHE_PAGE_SIZE - 2u) {
-        uint8_t *p = rom_cache_page(e, off);
-        if (p)
-            return (uint16_t)(p[in] | ((uint16_t)p[in + 1] << 8));
+    if (!rom_chip_erased && rom_psram_ready && rom_psram &&
+        off <= e->dev.rom_size - 2u) {
+        uint32_t sec = off / ROM_OVERLAY_SECTOR_SIZE;
+        uint32_t in = off & (ROM_OVERLAY_SECTOR_SIZE - 1u);
+        if (sec < ROM_OVERLAY_MAX_SECTORS && !rom_overlay[sec] &&
+            in <= ROM_OVERLAY_SECTOR_SIZE - 2u)
+            return (uint16_t)(rom_psram[off] | ((uint16_t)rom_psram[off + 1] << 8));
     }
-
     return (uint16_t)(rom_read_byte(e, off) |
                       ((uint16_t)rom_read_byte(e, off + 1u) << 8));
 }
@@ -116,21 +105,17 @@ static inline uint16_t rom_read16_cached(Emu *e, uint32_t off)
 static inline uint32_t rom_read32_cached(Emu *e, uint32_t off)
 {
     off &= (e->dev.rom_size - 1u);
-    uint32_t sec = off / ROM_OVERLAY_SECTOR_SIZE;
-    uint32_t in = off & (ROM_CACHE_PAGE_SIZE - 1u);
-
-    if (!rom_chip_erased &&
-        sec < ROM_OVERLAY_MAX_SECTORS &&
-        !rom_overlay[sec] &&
-        in <= ROM_CACHE_PAGE_SIZE - 4u) {
-        uint8_t *p = rom_cache_page(e, off);
-        if (p)
-            return (uint32_t)p[in] |
-                   ((uint32_t)p[in + 1] << 8) |
-                   ((uint32_t)p[in + 2] << 16) |
-                   ((uint32_t)p[in + 3] << 24);
+    if (!rom_chip_erased && rom_psram_ready && rom_psram &&
+        off <= e->dev.rom_size - 4u) {
+        uint32_t sec = off / ROM_OVERLAY_SECTOR_SIZE;
+        uint32_t in = off & (ROM_OVERLAY_SECTOR_SIZE - 1u);
+        if (sec < ROM_CACHE_SLOTS && !rom_overlay[sec] &&
+            in <= ROM_OVERLAY_SECTOR_SIZE - 4u)
+            return (uint32_t)rom_psram[off] |
+                   ((uint32_t)rom_psram[off + 1] << 8) |
+                   ((uint32_t)rom_psram[off + 2] << 16) |
+                   ((uint32_t)rom_psram[off + 3] << 24);
     }
-
     return (uint32_t)rom_read_byte(e, off) |
            ((uint32_t)rom_read_byte(e, off + 1u) << 8) |
            ((uint32_t)rom_read_byte(e, off + 2u) << 16) |
@@ -160,7 +145,7 @@ static uint8_t *rom_overlay_sector(Emu *e, uint32_t off)
         if (rom_chip_erased)
             memset(p, 0xFF, ROM_OVERLAY_SECTOR_SIZE);
         else {
-            uint8_t *src = rom_cache_page(e, base);
+            uint8_t *src = rom_psram_ready ? rom_psram + base : NULL;
             if (!src) {
                 free(p);
                 return NULL;
