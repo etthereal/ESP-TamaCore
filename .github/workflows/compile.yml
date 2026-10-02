@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - esp32-interpreter-fast
+      - tamaos-psram-fullrom
   pull_request:
     branches:
       - main
