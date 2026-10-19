@@ -23,11 +23,14 @@ static bool rom_chip_erased;
 #if !defined(TAMA_ROM_FROM_SD)
 static const esp_partition_t *rom_partition;
 #endif
+#define ROM_CACHE_MAX_PAGES (PS_ROM_SIZE / ROM_CACHE_PAGE_SIZE)
 static uint8_t *rom_cache_data[ROM_CACHE_SLOTS];
 static uint16_t rom_cache_tag[ROM_CACHE_SLOTS];
 static uint32_t rom_cache_age[ROM_CACHE_SLOTS];
+static uint8_t rom_page_slot[ROM_CACHE_MAX_PAGES];
 static uint32_t rom_cache_clock;
 static bool rom_cache_valid[ROM_CACHE_SLOTS];
+static bool rom_page_slot_initialised;
 
 /*
  * Fully associative LRU cache instead of a direct-mapped cache.
@@ -61,17 +64,24 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
     }
 #endif
 
-    /* Cache hit: update recency and return the resident page. */
-    for (uint32_t i = 0; i < ROM_CACHE_SLOTS; ++i) {
-        if (rom_cache_valid[i] && rom_cache_tag[i] == page) {
+    if (!rom_page_slot_initialised) {
+        memset(rom_page_slot, 0xFF, sizeof rom_page_slot);
+        rom_page_slot_initialised = true;
+    }
+
+    /* O(1) page-to-slot lookup keeps the hot ROM-read path inexpensive. */
+    if (page < ROM_CACHE_MAX_PAGES) {
+        uint8_t hit = rom_page_slot[page];
+        if (hit < ROM_CACHE_SLOTS &&
+            rom_cache_valid[hit] && rom_cache_tag[hit] == page) {
             if (++rom_cache_clock == 0) {
                 /* Avoid age-order ambiguity after the counter wraps. */
                 for (uint32_t j = 0; j < ROM_CACHE_SLOTS; ++j)
                     rom_cache_age[j] = 0;
                 rom_cache_clock = 1;
             }
-            rom_cache_age[i] = rom_cache_clock;
-            return rom_cache_data[i];
+            rom_cache_age[hit] = rom_cache_clock;
+            return rom_cache_data[hit];
         }
     }
 
@@ -88,6 +98,10 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
     }
 
     if (slot == ROM_CACHE_SLOTS) slot = 0;
+
+    /* Remove the evicted page's reverse mapping before reusing its slot. */
+    if (rom_cache_valid[slot] && rom_cache_tag[slot] < ROM_CACHE_MAX_PAGES)
+        rom_page_slot[rom_cache_tag[slot]] = 0xFFu;
 
     if (!rom_cache_data[slot]) {
         rom_cache_data[slot] = (uint8_t *)ps_malloc(ROM_CACHE_PAGE_SIZE);
@@ -135,6 +149,8 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
     rom_cache_tag[slot] = (uint16_t)page;
     rom_cache_age[slot] = rom_cache_clock;
     rom_cache_valid[slot] = true;
+    if (page < ROM_CACHE_MAX_PAGES)
+        rom_page_slot[page] = (uint8_t)slot;
     return rom_cache_data[slot];
 }
 
