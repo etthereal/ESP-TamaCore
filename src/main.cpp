@@ -954,15 +954,9 @@ static bool initialise_emulator()
 
     // ROM reads are served by tamaemu/mem.c from the dedicated tamarom
     // partition through a 2 MiB PSRAM page cache.
-#if defined(TAMA_TARGET_PLUS_COLOR)
-    emu->rom = guest_rom_psram;
-    if (emu->rom == nullptr) {
-        fatal_error("Plus Color ROM was not loaded into PSRAM.");
-        return false;
-    }
-#else
+// All supported targets use the shared 64 KiB ROM page cache. The
+    // backing store is either internal Flash or the SD file selected at build.
     emu->rom = nullptr;
-#endif
 
 
     emu->cmu.osc3_hz =
