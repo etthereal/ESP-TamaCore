@@ -46,6 +46,8 @@
 #include <esp_heap_caps.h>
 #include <esp32-hal-psram.h>
 #include <esp_partition.h>
+#include <SD.h>
+#include <SPI.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -61,6 +63,28 @@
 // ============================================================================
 
 static const esp_partition_t *rom_partition = nullptr;
+
+#if defined(TAMA_TARGET_PLUS_COLOR)
+#ifndef TAMA_SD_MOSI
+#define TAMA_SD_MOSI 11
+#endif
+#ifndef TAMA_SD_MISO
+#define TAMA_SD_MISO 13
+#endif
+#ifndef TAMA_SD_SCK
+#define TAMA_SD_SCK 12
+#endif
+#ifndef TAMA_SD_CS
+#define TAMA_SD_CS 10
+#endif
+#ifndef TAMA_SD_ROM_PATH
+#define TAMA_SD_ROM_PATH "/pluscolor.bin"
+#endif
+
+// Load the guest ROM once at boot. The emulation hot path never reads the SD.
+static SPIClass sdSPI(FSPI);
+static uint8_t *guest_rom_psram = nullptr;
+#endif
 
 
 // ============================================================================
@@ -186,8 +210,13 @@ static constexpr int DISPLAY_Y =
 
 // Tamagotchi P's NOR size.
 
+#if defined(TAMA_TARGET_PLUS_COLOR)
 static constexpr size_t EXPECTED_ROM_SIZE =
-    0x00800000UL; // 8 MiB
+    0x00400000UL; // Plus Color: 4 MiB
+#else
+static constexpr size_t EXPECTED_ROM_SIZE =
+    0x00800000UL; // P's: 8 MiB
+#endif
 
 
 // ============================================================================
@@ -381,6 +410,92 @@ static bool initialise_psram()
 
 static bool initialise_rom()
 {
+#if defined(TAMA_TARGET_PLUS_COLOR)
+    Serial.println("[ROM] loading Plus Color firmware from SD into PSRAM...");
+    Serial.printf("[SD] SPI pins MOSI=%d MISO=%d SCK=%d CS=%d\n",
+                  TAMA_SD_MOSI, TAMA_SD_MISO, TAMA_SD_SCK, TAMA_SD_CS);
+
+    // The LCD frontend uses HSPI; use FSPI for the TF card.
+    sdSPI.begin(TAMA_SD_SCK, TAMA_SD_MISO, TAMA_SD_MOSI, TAMA_SD_CS);
+    if (!SD.begin(TAMA_SD_CS, sdSPI, 25000000)) {
+        fatal_error("SD init failed. Check card format and SD pin mapping.");
+        return false;
+    }
+
+    File romFile = SD.open(TAMA_SD_ROM_PATH, FILE_READ);
+    if (!romFile) {
+        SD.end();
+        fatal_error("Missing /pluscolor.bin on the SD card.");
+        return false;
+    }
+
+    const size_t fileSize = romFile.size();
+    Serial.printf("[ROM] file size: %u bytes\n",
+                  static_cast<unsigned>(fileSize));
+    if (fileSize != EXPECTED_ROM_SIZE) {
+        romFile.close();
+        SD.end();
+        fatal_error("Plus Color ROM must be exactly 4 MiB.");
+        return false;
+    }
+
+    guest_rom_psram = static_cast<uint8_t *>(ps_malloc(EXPECTED_ROM_SIZE));
+    if (!guest_rom_psram) {
+        romFile.close();
+        SD.end();
+        fatal_error("Could not allocate 4 MiB ROM in PSRAM.");
+        return false;
+    }
+
+    // Sequential large reads only during startup.
+    constexpr size_t CHUNK_SIZE = 32 * 1024;
+    size_t offset = 0;
+    while (offset < EXPECTED_ROM_SIZE) {
+        const size_t wanted =
+            (EXPECTED_ROM_SIZE - offset < CHUNK_SIZE)
+                ? EXPECTED_ROM_SIZE - offset
+                : CHUNK_SIZE;
+        const size_t got = romFile.read(guest_rom_psram + offset, wanted);
+        if (got != wanted) {
+            romFile.close();
+            SD.end();
+            free(guest_rom_psram);
+            guest_rom_psram = nullptr;
+            fatal_error("Short read while loading Plus Color ROM.");
+            return false;
+        }
+        offset += got;
+        if ((offset & 0x3FFFFu) == 0) {
+            Serial.printf("[ROM] loaded %u / %u bytes\n",
+                          static_cast<unsigned>(offset),
+                          static_cast<unsigned>(EXPECTED_ROM_SIZE));
+            taskYIELD();
+        }
+    }
+
+    romFile.close();
+    SD.end(); // No SD reads/writes during emulation.
+
+    bool allErased = true;
+    for (size_t i = 0; i < 32; ++i) {
+        if (guest_rom_psram[i] != 0xFF) {
+            allErased = false;
+            break;
+        }
+    }
+    if (allErased) {
+        free(guest_rom_psram);
+        guest_rom_psram = nullptr;
+        fatal_error("ROM appears erased (all 0xFF at start).");
+        return false;
+    }
+
+    Serial.printf("[ROM] Plus Color image resident in PSRAM at %p\n",
+                  guest_rom_psram);
+    Serial.printf("[PSRAM] free after ROM load: %u bytes\n",
+                  static_cast<unsigned>(ESP.getFreePsram()));
+    return true;
+#else
     Serial.println("[ROM] locating raw tamarom partition...");
 
     rom_partition = esp_partition_find_first(
@@ -389,84 +504,47 @@ static bool initialise_rom()
         "tamarom"
     );
 
-    if (rom_partition == nullptr)
-    {
-        fatal_error(
-            "Raw tamarom partition was not found."
-        );
-
+    if (rom_partition == nullptr) {
+        fatal_error("Raw tamarom partition was not found.");
         return false;
     }
 
-    Serial.printf(
-        "[ROM] partition offset : 0x%08X\n",
-        static_cast<unsigned>(rom_partition->address)
-    );
+    Serial.printf("[ROM] partition offset : 0x%08X\n",
+                  static_cast<unsigned>(rom_partition->address));
+    Serial.printf("[ROM] partition size   : %u bytes\n",
+                  static_cast<unsigned>(rom_partition->size));
 
-    Serial.printf(
-        "[ROM] partition size   : %u bytes\n",
-        static_cast<unsigned>(rom_partition->size)
-    );
-
-    if (rom_partition->size < EXPECTED_ROM_SIZE)
-    {
-        fatal_error(
-            "tamarom partition is smaller than 8 MB."
-        );
-
+    if (rom_partition->size < EXPECTED_ROM_SIZE) {
+        fatal_error("tamarom partition is smaller than 8 MB.");
         return false;
     }
 
     uint8_t header[32] = {};
-
     const esp_err_t err = esp_partition_read(
-        rom_partition,
-        0,
-        header,
-        sizeof(header)
-    );
+        rom_partition, 0, header, sizeof(header));
 
-    if (err != ESP_OK)
-    {
-        Serial.printf(
-            "[ROM] partition read failed: %d\n",
-            static_cast<int>(err)
-        );
-
-        fatal_error(
-            "Could not read P's ROM partition."
-        );
-
+    if (err != ESP_OK) {
+        Serial.printf("[ROM] partition read failed: %d\n", static_cast<int>(err));
+        fatal_error("Could not read P's ROM partition.");
         return false;
     }
 
     bool looks_erased = true;
-
-    for (size_t i = 0; i < sizeof(header); ++i)
-    {
-        if (header[i] != 0xFF)
-        {
+    for (size_t i = 0; i < sizeof(header); ++i) {
+        if (header[i] != 0xFF) {
             looks_erased = false;
             break;
         }
     }
-
-    if (looks_erased)
-    {
-        fatal_error(
-            "tamarom partition appears erased; ps.bin was not flashed."
-        );
-
+    if (looks_erased) {
+        fatal_error("tamarom partition appears erased; ps.bin was not flashed.");
         return false;
     }
 
-    Serial.println(
-        "[ROM] raw Flash partition ready; PSRAM cache will load pages on demand"
-    );
-
+    Serial.println("[ROM] raw Flash partition ready; PSRAM cache will load pages on demand");
     return true;
+#endif
 }
-
 
 // ============================================================================
 // Display
@@ -872,8 +950,11 @@ static bool initialise_emulator()
     // Select TamaEmu's real P's device profile.
     // ------------------------------------------------------------------------
 
-    const DeviceProfile *device =
-        device_find("ps");
+#if defined(TAMA_TARGET_PLUS_COLOR)
+    const DeviceProfile *device = device_find("plus-color");
+#else
+    const DeviceProfile *device = device_find("ps");
+#endif
 
 
     if (device == nullptr)
@@ -910,8 +991,15 @@ static bool initialise_emulator()
 
     // ROM reads are served by tamaemu/mem.c from the dedicated tamarom
     // partition through a 2 MiB PSRAM page cache.
-    emu->rom =
-        nullptr;
+#if defined(TAMA_TARGET_PLUS_COLOR)
+    emu->rom = guest_rom_psram;
+    if (emu->rom == nullptr) {
+        fatal_error("Plus Color ROM was not loaded into PSRAM.");
+        return false;
+    }
+#else
+    emu->rom = nullptr;
+#endif
 
 
     emu->cmu.osc3_hz =
@@ -1390,7 +1478,7 @@ void setup()
     );
 
     Serial.println(
-        " ROM source: raw Flash partition"
+        " ROM source: SD -> PSRAM (Plus Color build)"
     );
 
     Serial.println(
@@ -1439,7 +1527,7 @@ void setup()
     );
 
     Serial.println(
-        "[BOOT] Waiting for P's firmware..."
+        "[BOOT] Waiting for guest firmware..."
     );
 }
 
