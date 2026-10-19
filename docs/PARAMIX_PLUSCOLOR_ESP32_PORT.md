@@ -1,44 +1,41 @@
-# ESP-TamaCore: experimental Plus Color / Paramix-inspired port
+# Paramix-inspired colour Tamagotchi emulation on ESP32-S3
 
-This branch adds an experimental Tamagotchi Plus Color target to ESP-TamaCore for the Waveshare ESP32-S3-LCD-1.3 (ESP32-S3R8, 240 MHz, 8 MiB PSRAM, 16 MiB flash).
+This is an experimental ESP-TamaCore adaptation for Waveshare ESP32-S3-LCD-1.3 (16 MiB Flash, 8 MiB PSRAM). It uses the portable TamaEmu S1C33 emulator core that underlies Paramix Studio, rather than trying to execute Paramix's Paradise-specific `emu.bin` on the ESP32.
 
-It reuses the TamaEmu S1C33 interpreter and the plus-color device profile. It does not run Paramix Studio's Paradise-specific emu.bin: that binary targets the Paradise's ARM Thumb-2 CPU and hardware, not the ESP32-S3 Xtensa LX7.
+## Why this is not a direct Paramix binary port
 
-## Flash-backed ROM design
+Paramix's `emu.bin` is compiled for the Tamagotchi Paradise's ARM Thumb-2 CPU and hardware. The ESP32-S3 uses Xtensa LX7, so that binary cannot be executed as-is. The reusable part is the shared S1C33 guest emulator, device profiles and ROM-handling concepts. The Paradise-specific JIT would need a separate Xtensa implementation to be ported.
 
-- Build target: pio run -e pluscolor_flash
-- Firmware input: the user's own legal dump, flashed at offset 0x310000 into the tamarom partition.
-- Partition capacity: 8 MiB, enough for raw 4 MiB or 8 MiB images when the selected device profile expects that size.
-- Runtime: the ROM remains in the ESP32's 16 MiB flash. The existing memory layer reads 64 KiB pages into a small PSRAM cache on demand. It does not copy the whole ROM to PSRAM and does not use the SD card.
-- The guest firmware sees an emulated NOR chip. Writes/erases currently use a PSRAM copy-on-write overlay. Those changes are volatile and are lost on power-off until a persistent overlay/save backend is added.
-- The existing P's environment remains the default and uses the same flash-backed page-cache approach.
+## SD-backed builds
 
-This is conceptually similar to Paramix's flash-resident guest firmware, but it is not a byte-for-byte port of Paramix's packing format. Paramix skips unused 64 KiB blocks and keeps spare pages for guest writes; ESP-TamaCore currently stores a raw ROM image and caches reads. Packing sparse ROM blocks and persisting write overlays are future steps.
+PlatformIO environments added in this branch:
 
-## Flashing the ROM
+- `pio run -e ps_sd`: P's; place the user's own raw 8 MiB firmware dump at `/ps.bin` on a FAT-formatted TF card.
+- `pio run -e 4uplus_sd`: 4U+; place the user's own raw 8 MiB firmware dump at `/4uplus.bin`.
+- `pio run -e 4u_sd`: original 4U; place the user's own raw 8 MiB firmware dump at `/4u.bin`.
+- `pio run -e pluscolor_flash`: Plus Color; 4 MiB ROM remains in the `tamarom` flash partition.
 
-The tamarom partition begins at 0x310000 and is 0x800000 bytes long in partitions.csv. Flash a raw ROM image to this partition using the appropriate ESP32 flash tool, preserving the application and partition table. Do not flash an entire 16 MiB image over the device unless it was deliberately built for this exact partition layout.
+The SD-backed builds read the ROM in 64 KiB pages into a 32-slot PSRAM cache (up to 2 MiB), rather than copying the entire 8 MiB image into PSRAM. This keeps the ROM on the TF card and leaves PSRAM available for emulator state and cache. The SD interface is initialized with GPIO MOSI=11, MISO=13, SCK=12, CS=10; confirm these pins against the exact board revision if card initialization fails.
 
-The Plus Color profile currently expects a 4 MiB image. The 8 MiB partition capacity does not automatically make an 8 MiB firmware compatible with a profile configured for 4 MiB; the device profile and ROM size must match. P's uses an 8 MiB profile.
+## Important limitations
 
-## What is not done yet
+- Experimental and not yet compiled or hardware-tested in this branch.
+- SD page-cache misses perform a seek and 64 KiB read during emulation. Performance and timing stability must be measured on hardware; the cache is a first functional design, not a claim of real-time performance.
+- Guest flash writes currently use a volatile copy-on-write overlay in PSRAM. Saves and firmware changes are lost on power-off. A persistent save/overlay file on SD is a required next step.
+- The ROM dump is not included. Use a firmware dump from a device you own; the project does not distribute copyrighted firmware.
+- Physical buttons, audio, IR and NFC frontends are not yet fully integrated into this ESP32 build.
+- The Plus Color target and P's/4U targets use the existing TamaEmu device profiles. This is not the full Paramix Studio UI, Paradise menu or its packing format.
 
-1. Not compiled or hardware-tested in this commit.
-2. Guest flash writes are not persistent across power cycles.
-3. Buttons and GPIO-IR are not wired to physical hardware yet.
-4. Audio output is not implemented by the current frontend.
-5. Real-time performance is unknown. The Paradise port's JIT cannot be reused directly because it emits ARM Thumb-2 code; this target uses TamaEmu's native interpreter.
+## Memory layout
 
-## Next validation steps
+- ESP32 application and project data: internal 16 MiB flash, partitioned by `partitions.csv`.
+- P's/4U firmware source: TF card, raw 8 MiB image.
+- Guest ROM read cache: up to 2 MiB PSRAM (32 × 64 KiB pages).
+- Emulator state and working memory: PSRAM.
+- Persistent save backend: not implemented yet.
 
-1. Build with PlatformIO: pio run -e pluscolor_flash.
-2. Flash the application, then write the user's own 4 MiB Plus Color dump to the tamarom partition at offset 0x310000.
-3. Confirm the serial log detects the raw flash partition and the Plus Color device profile.
-4. Verify the reset vector, startup and LCD activity.
-5. Measure emulation speed; then add persistent save/overlay storage.
-
-## Upstream references
+## Upstream projects
 
 - Paramix Studio: https://github.com/mameise/Paramix-Studio
-- TamaEmu: https://github.com/maragotchi/tamaemu
-- Waveshare ESP32-S3-LCD-1.3: https://www.waveshare.com/wiki/ESP32-S3-LCD-1.3
+- TamaEmu core: https://github.com/maragotchi/tamaemu
+- Waveshare board pinout: https://www.waveshare.com/wiki/ESP32-S3-LCD-1.3
