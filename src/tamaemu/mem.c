@@ -73,10 +73,15 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
             rom_cache_age[i] = rom_cache_clock;
             return rom_cache_data[i];
         }
+    }
+
+    /* Prefer an unused slot. Once full, evict the least-recently used page. */
+    for (uint32_t i = 0; i < ROM_CACHE_SLOTS; ++i) {
         if (!rom_cache_valid[i]) {
-            if (slot == ROM_CACHE_SLOTS) slot = i;
-        } else if (slot == ROM_CACHE_SLOTS &&
-                   rom_cache_age[i] < oldest_age) {
+            slot = i;
+            break;
+        }
+        if (rom_cache_age[i] < oldest_age) {
             oldest_age = rom_cache_age[i];
             slot = i;
         }
