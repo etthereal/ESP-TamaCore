@@ -1434,9 +1434,13 @@ void setup()
         " TamaEmu S1C33 native frontend"
     );
 
-    Serial.println(
-        " ROM source: SD -> PSRAM (Plus Color build)"
-    );
+#if defined(TAMA_ROM_FROM_SD)
+    Serial.println(" ROM source: SD-backed 64 KiB page cache");
+#elif defined(TAMA_TARGET_PLUS_COLOR)
+    Serial.println(" ROM source: internal Flash-backed 64 KiB page cache");
+#else
+    Serial.println(" ROM source: internal Flash-backed 64 KiB page cache");
+#endif
 
     Serial.println(
         "========================================"
