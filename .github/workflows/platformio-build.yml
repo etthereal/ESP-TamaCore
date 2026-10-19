@@ -1,0 +1,28 @@
+name: PlatformIO build
+
+on:
+  push:
+    branches: [paramix-pluscolor-psram-sd]
+  pull_request:
+    branches: [esp32-interpreter-fast, main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - pluscolor_flash
+          - ps_sd
+          - 4uplus_sd
+          - 4u_sd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+      - name: Compile target
+        run: pio run -e ${{ matrix.environment }}
