@@ -33,7 +33,7 @@
  * This places TamaEmu's internal RAM, LCD GRAM and most emulator
  * state in external PSRAM.
  *
- * The original 8 MB ROM remains memory-mapped in ESP32 Flash.
+ * The guest ROM stays in Flash; a small PSRAM page cache serves reads.
  */
 
 #include <Arduino.h>
@@ -47,21 +47,49 @@
 #include <esp32-hal-psram.h>
 #include <esp_partition.h>
 
+#if defined(TAMA_ROM_FROM_SD)
+#include <SD.h>
+#include <SPI.h>
+
+#ifndef TAMA_SD_MOSI
+#define TAMA_SD_MOSI 11
+#endif
+#ifndef TAMA_SD_MISO
+#define TAMA_SD_MISO 13
+#endif
+#ifndef TAMA_SD_SCK
+#define TAMA_SD_SCK 12
+#endif
+#ifndef TAMA_SD_CS
+#define TAMA_SD_CS 10
+#endif
+
+#if defined(TAMA_TARGET_4U)
+#define TAMA_SD_ROM_PATH "/4uplus.bin"
+#elif defined(TAMA_TARGET_4U_PLAIN)
+#define TAMA_SD_ROM_PATH "/4u.bin"
+#else
+#define TAMA_SD_ROM_PATH "/ps.bin"
+#endif
+
+static SPIClass romSD_SPI(FSPI);
+static File guest_rom_file;
+#endif
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 
 // ============================================================================
-// P's ROM raw Flash partition
+// Guest ROM raw Flash partition
 // ============================================================================
 //
-// The 8 MiB ROM is flashed separately into the "tamarom" partition at
+// The guest ROM is flashed separately into the "tamarom" partition at
 // 0x310000. Keeping it outside firmware.bin avoids an 8+ MiB application
-// image during boot and lets the ESP32 map the ROM directly from Flash.
+// image during boot and lets the emulator read it through a small PSRAM page cache.
 // ============================================================================
 
 static const esp_partition_t *rom_partition = nullptr;
-
 
 // ============================================================================
 // TFT_eSPI configuration validation
@@ -186,8 +214,13 @@ static constexpr int DISPLAY_Y =
 
 // Tamagotchi P's NOR size.
 
+#if defined(TAMA_TARGET_PLUS_COLOR)
 static constexpr size_t EXPECTED_ROM_SIZE =
-    0x00800000UL; // 8 MiB
+    0x00400000UL; // Plus Color: 4 MiB
+#else
+static constexpr size_t EXPECTED_ROM_SIZE =
+    0x00800000UL; // P's: 8 MiB
+#endif
 
 
 // ============================================================================
@@ -381,7 +414,54 @@ static bool initialise_psram()
 
 static bool initialise_rom()
 {
-    Serial.println("[ROM] locating raw tamarom partition...");
+#if defined(TAMA_ROM_FROM_SD)
+    Serial.printf("[SD] SPI pins MOSI=%d MISO=%d SCK=%d CS=%d\n",
+                  TAMA_SD_MOSI, TAMA_SD_MISO, TAMA_SD_SCK, TAMA_SD_CS);
+    romSD_SPI.begin(TAMA_SD_SCK, TAMA_SD_MISO, TAMA_SD_MOSI, TAMA_SD_CS);
+    if (!SD.begin(TAMA_SD_CS, romSD_SPI, 10000000)) {
+        fatal_error("SD init failed; check card format and TF pin mapping.");
+        return false;
+    }
+
+    guest_rom_file = SD.open(TAMA_SD_ROM_PATH, FILE_READ);
+    if (!guest_rom_file) {
+        SD.end();
+        fatal_error("ROM file missing on SD; check the expected filename.");
+        return false;
+    }
+
+    const size_t file_size = guest_rom_file.size();
+    Serial.printf("[ROM] SD image: %s (%u bytes)\n",
+                  TAMA_SD_ROM_PATH, static_cast<unsigned>(file_size));
+    if (file_size != EXPECTED_ROM_SIZE) {
+        guest_rom_file.close();
+        SD.end();
+        fatal_error("P's / 4U ROM must be exactly 8 MiB for this target.");
+        return false;
+    }
+
+    uint8_t header[32] = {};
+    if (guest_rom_file.seek(0) != true ||
+        guest_rom_file.read(header, sizeof(header)) != sizeof(header)) {
+        guest_rom_file.close();
+        SD.end();
+        fatal_error("Could not read ROM header from SD.");
+        return false;
+    }
+    bool erased = true;
+    for (size_t i = 0; i < sizeof(header); ++i)
+        if (header[i] != 0xFF) { erased = false; break; }
+    if (erased) {
+        guest_rom_file.close();
+        SD.end();
+        fatal_error("SD ROM appears erased (header is all 0xFF).");
+        return false;
+    }
+    guest_rom_file.seek(0);
+    Serial.println("[ROM] SD-backed 64 KiB page cache ready; ROM is not copied to PSRAM.");
+    return true;
+#else
+    Serial.println("[ROM] locating raw tamarom Flash partition...");
 
     rom_partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA,
@@ -389,84 +469,41 @@ static bool initialise_rom()
         "tamarom"
     );
 
-    if (rom_partition == nullptr)
-    {
-        fatal_error(
-            "Raw tamarom partition was not found."
-        );
-
+    if (rom_partition == nullptr) {
+        fatal_error("Raw tamarom partition was not found.");
         return false;
     }
-
-    Serial.printf(
-        "[ROM] partition offset : 0x%08X\n",
-        static_cast<unsigned>(rom_partition->address)
-    );
-
-    Serial.printf(
-        "[ROM] partition size   : %u bytes\n",
-        static_cast<unsigned>(rom_partition->size)
-    );
-
-    if (rom_partition->size < EXPECTED_ROM_SIZE)
-    {
-        fatal_error(
-            "tamarom partition is smaller than 8 MB."
-        );
-
+    if (rom_partition->size < EXPECTED_ROM_SIZE) {
+        fatal_error("tamarom partition is smaller than this device's ROM.");
         return false;
     }
-
     uint8_t header[32] = {};
-
-    const esp_err_t err = esp_partition_read(
-        rom_partition,
-        0,
-        header,
-        sizeof(header)
-    );
-
-    if (err != ESP_OK)
-    {
-        Serial.printf(
-            "[ROM] partition read failed: %d\n",
-            static_cast<int>(err)
-        );
-
-        fatal_error(
-            "Could not read P's ROM partition."
-        );
-
+    const esp_err_t err = esp_partition_read(rom_partition, 0, header, sizeof(header));
+    if (err != ESP_OK) {
+        fatal_error("Could not read the ROM from Flash.");
         return false;
     }
-
-    bool looks_erased = true;
-
+    bool erased = true;
     for (size_t i = 0; i < sizeof(header); ++i)
-    {
-        if (header[i] != 0xFF)
-        {
-            looks_erased = false;
-            break;
-        }
-    }
-
-    if (looks_erased)
-    {
-        fatal_error(
-            "tamarom partition appears erased; ps.bin was not flashed."
-        );
-
+        if (header[i] != 0xFF) { erased = false; break; }
+    if (erased) {
+        fatal_error("tamarom partition appears erased; flash the ROM image first.");
         return false;
     }
-
-    Serial.println(
-        "[ROM] raw Flash partition ready; PSRAM cache will load pages on demand"
-    );
-
+    Serial.println("[ROM] flash-backed page cache ready.");
     return true;
+#endif
 }
 
+#if defined(TAMA_ROM_FROM_SD)
+extern "C" int tama_rom_storage_read(uint32_t offset, uint8_t *dst, size_t len)
+{
+    if (!guest_rom_file || !dst) return -1;
+    if (!guest_rom_file.seek(offset)) return -2;
+    const int got = guest_rom_file.read(dst, len);
+    return got == static_cast<int>(len) ? 0 : -3;
+}
+#endif
 
 // ============================================================================
 // Display
@@ -872,8 +909,15 @@ static bool initialise_emulator()
     // Select TamaEmu's real P's device profile.
     // ------------------------------------------------------------------------
 
-    const DeviceProfile *device =
-        device_find("ps");
+#if defined(TAMA_TARGET_PLUS_COLOR)
+    const DeviceProfile *device = device_find("plus-color");
+#elif defined(TAMA_TARGET_4U)
+    const DeviceProfile *device = device_find("4u");
+#elif defined(TAMA_TARGET_4U_PLAIN)
+    const DeviceProfile *device = device_find("4u-plain");
+#else
+    const DeviceProfile *device = device_find("ps");
+#endif
 
 
     if (device == nullptr)
@@ -910,8 +954,9 @@ static bool initialise_emulator()
 
     // ROM reads are served by tamaemu/mem.c from the dedicated tamarom
     // partition through a 2 MiB PSRAM page cache.
-    emu->rom =
-        nullptr;
+// All supported targets use the shared 64 KiB ROM page cache. The
+    // backing store is either internal Flash or the SD file selected at build.
+    emu->rom = nullptr;
 
 
     emu->cmu.osc3_hz =
@@ -1389,9 +1434,13 @@ void setup()
         " TamaEmu S1C33 native frontend"
     );
 
-    Serial.println(
-        " ROM source: raw Flash partition"
-    );
+#if defined(TAMA_ROM_FROM_SD)
+    Serial.println(" ROM source: SD-backed 64 KiB page cache");
+#elif defined(TAMA_TARGET_PLUS_COLOR)
+    Serial.println(" ROM source: internal Flash-backed 64 KiB page cache");
+#else
+    Serial.println(" ROM source: internal Flash-backed 64 KiB page cache");
+#endif
 
     Serial.println(
         "========================================"
@@ -1439,7 +1488,7 @@ void setup()
     );
 
     Serial.println(
-        "[BOOT] Waiting for P's firmware..."
+        "[BOOT] Waiting for guest firmware..."
     );
 }
 

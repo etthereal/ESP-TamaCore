@@ -1,0 +1,82 @@
+name: PlatformIO build
+
+on:
+  push:
+    branches: [paramix-pluscolor-psram-sd]
+  pull_request:
+    branches: [esp32-interpreter-fast, main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - pluscolor_flash
+          - ps_sd
+          - 4uplus_sd
+          - 4u_sd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+      - name: Compile target
+        run: pio run -e ${{ matrix.environment }}
+      - name: Assemble flash package
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD=".pio/build/${{ matrix.environment }}"
+          OUT="flash-package-${{ matrix.environment }}"
+          mkdir -p "$OUT"
+          cp "$BUILD/bootloader.bin" "$OUT/bootloader.bin"
+          cp "$BUILD/partitions.bin" "$OUT/partitions.bin"
+          cp "$BUILD/firmware.bin" "$OUT/firmware.bin"
+          BOOT_APP0="$(find "$HOME/.platformio/packages" -path '*/tools/partitions/boot_app0.bin' -print -quit)"
+          test -n "$BOOT_APP0"
+          cp "$BOOT_APP0" "$OUT/boot_app0.bin"
+          cat > "$OUT/LEEME.txt" <<'EOF'
+          ESP-TamaCore - paquete de flasheo ESP32-S3
+          
+          Placa objetivo: Waveshare ESP32-S3-LCD-1.3 (flash 16 MB, PSRAM OPI 8 MB).
+          Antes de grabar, confirma que esta es exactamente tu placa.
+          
+          Archivos y direcciones:
+          bootloader.bin  -> 0x0000
+          partitions.bin  -> 0x8000
+          boot_app0.bin   -> 0xE000
+          firmware.bin    -> 0x10000
+          
+          En una terminal con esptool instalado, reemplaza PORT por el puerto serie de la placa y ejecuta:
+          esptool.py --chip esp32s3 --port PORT --baud 460800 write_flash -z 0x0000 bootloader.bin 0x8000 partitions.bin 0xE000 boot_app0.bin 0x10000 firmware.bin
+          
+          Si esptool no conecta, mantén BOOT pulsado, pulsa y suelta RESET, luego suelta BOOT e inténtalo de nuevo.
+          Esto sobrescribe el firmware y la tabla de particiones. No uses archivos de paquetes distintos.
+          
+          SD para los perfiles:
+          ps_sd:      tarjeta FAT32 con un volcado propio compatible de exactamente 8 MiB llamado ps.bin en la raíz.
+          4u_sd:      tarjeta FAT32 con un volcado propio compatible de exactamente 8 MiB llamado 4u.bin en la raíz.
+          4uplus_sd:  tarjeta FAT32 con un volcado propio compatible de exactamente 8 MiB llamado 4uplus.bin en la raíz.
+          pluscolor_flash: perfil Plus Color; no usa esos nombres de archivo SD para la ROM.
+          
+          Pines SD configurados en este build: MOSI=11, MISO=13, SCK=12, CS=10. La compatibilidad eléctrica debe confirmarse con la revisión exacta de la placa.
+          
+          IMPORTANTE: que compile no demuestra que arranque ni que emule correctamente. Estos builds son experimentales y no han sido probados en hardware en este flujo. No incluye ROMs.
+          EOF
+          cat > "$OUT/flash-addresses.txt" <<'EOF'
+          0x0000 bootloader.bin
+          0x8000 partitions.bin
+          0xE000 boot_app0.bin
+          0x10000 firmware.bin
+          EOF
+      - name: Upload complete flash package
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-package-${{ matrix.environment }}
+          path: flash-package-${{ matrix.environment }}/
+          if-no-files-found: error
+          retention-days: 14

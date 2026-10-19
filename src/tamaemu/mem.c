@@ -3,6 +3,11 @@
 #include <esp32-hal-psram.h>
 #include <esp_partition.h>
 
+#if defined(TAMA_ROM_FROM_SD)
+/* Implemented by the Arduino frontend; reads exact byte ranges from the open SD ROM. */
+extern int tama_rom_storage_read(uint32_t offset, uint8_t *dst, size_t len);
+#endif
+
 #define DEV const DeviceProfile *dev = &e->dev
 
 #define ROM_OVERLAY_SECTOR_SIZE 0x10000u
@@ -15,17 +20,34 @@ static uint8_t *rom_overlay[ROM_OVERLAY_MAX_SECTORS];
 static uint32_t rom_overlay_count;
 static bool rom_chip_erased;
 
+#if !defined(TAMA_ROM_FROM_SD)
 static const esp_partition_t *rom_partition;
+#endif
+#define ROM_CACHE_MAX_PAGES (PS_ROM_SIZE / ROM_CACHE_PAGE_SIZE)
 static uint8_t *rom_cache_data[ROM_CACHE_SLOTS];
 static uint16_t rom_cache_tag[ROM_CACHE_SLOTS];
+static uint32_t rom_cache_age[ROM_CACHE_SLOTS];
+static uint8_t rom_page_slot[ROM_CACHE_MAX_PAGES];
+static uint32_t rom_cache_clock;
 static bool rom_cache_valid[ROM_CACHE_SLOTS];
+static bool rom_page_slot_initialised;
 
+/*
+ * Fully associative LRU cache instead of a direct-mapped cache.
+ *
+ * SD-backed ROM has much higher miss latency than the Paradise's mapped flash.
+ * A direct-mapped cache can repeatedly evict two hot pages that happen to map
+ * to the same slot. Searching 32 tags is cheap compared with a 64 KiB SD read
+ * and avoids that pathological thrashing without consuming more PSRAM.
+ */
 static uint8_t *rom_cache_page(Emu *e, uint32_t off)
 {
     off &= (e->dev.rom_size - 1u);
     uint32_t page = off / ROM_CACHE_PAGE_SIZE;
-    uint32_t slot = page & (ROM_CACHE_SLOTS - 1u);
+    uint32_t slot = ROM_CACHE_SLOTS;
+    uint32_t oldest_age = UINT32_MAX;
 
+#if !defined(TAMA_ROM_FROM_SD)
     if (!rom_partition) {
         rom_partition = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA,
@@ -40,6 +62,46 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
             return NULL;
         }
     }
+#endif
+
+    if (!rom_page_slot_initialised) {
+        memset(rom_page_slot, 0xFF, sizeof rom_page_slot);
+        rom_page_slot_initialised = true;
+    }
+
+    /* O(1) page-to-slot lookup keeps the hot ROM-read path inexpensive. */
+    if (page < ROM_CACHE_MAX_PAGES) {
+        uint8_t hit = rom_page_slot[page];
+        if (hit < ROM_CACHE_SLOTS &&
+            rom_cache_valid[hit] && rom_cache_tag[hit] == page) {
+            if (++rom_cache_clock == 0) {
+                /* Avoid age-order ambiguity after the counter wraps. */
+                for (uint32_t j = 0; j < ROM_CACHE_SLOTS; ++j)
+                    rom_cache_age[j] = 0;
+                rom_cache_clock = 1;
+            }
+            rom_cache_age[hit] = rom_cache_clock;
+            return rom_cache_data[hit];
+        }
+    }
+
+    /* Prefer an unused slot. Once full, evict the least-recently used page. */
+    for (uint32_t i = 0; i < ROM_CACHE_SLOTS; ++i) {
+        if (!rom_cache_valid[i]) {
+            slot = i;
+            break;
+        }
+        if (rom_cache_age[i] < oldest_age) {
+            oldest_age = rom_cache_age[i];
+            slot = i;
+        }
+    }
+
+    if (slot == ROM_CACHE_SLOTS) slot = 0;
+
+    /* Remove the evicted page's reverse mapping before reusing its slot. */
+    if (rom_cache_valid[slot] && rom_cache_tag[slot] < ROM_CACHE_MAX_PAGES)
+        rom_page_slot[rom_cache_tag[slot]] = 0xFFu;
 
     if (!rom_cache_data[slot]) {
         rom_cache_data[slot] = (uint8_t *)ps_malloc(ROM_CACHE_PAGE_SIZE);
@@ -50,29 +112,45 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
                      (unsigned)slot);
             return NULL;
         }
-        rom_cache_valid[slot] = false;
     }
 
-    if (!rom_cache_valid[slot] || rom_cache_tag[slot] != page) {
-        esp_err_t err = esp_partition_read(
-            rom_partition,
-            page * ROM_CACHE_PAGE_SIZE,
-            rom_cache_data[slot],
-            ROM_CACHE_PAGE_SIZE
-        );
-
-        if (err != ESP_OK) {
-            e->stopped = true;
-            snprintf(e->stop_reason, sizeof e->stop_reason,
-                     "ROM cache read failed page %u err=%d",
-                     (unsigned)page, (int)err);
-            return NULL;
-        }
-
-        rom_cache_tag[slot] = (uint16_t)page;
-        rom_cache_valid[slot] = true;
+#if defined(TAMA_ROM_FROM_SD)
+    if (tama_rom_storage_read(page * ROM_CACHE_PAGE_SIZE,
+                              rom_cache_data[slot],
+                              ROM_CACHE_PAGE_SIZE) != 0) {
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "SD ROM cache read failed page %u",
+                 (unsigned)page);
+        return NULL;
     }
+#else
+    esp_err_t err = esp_partition_read(
+        rom_partition,
+        page * ROM_CACHE_PAGE_SIZE,
+        rom_cache_data[slot],
+        ROM_CACHE_PAGE_SIZE
+    );
 
+    if (err != ESP_OK) {
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "ROM cache read failed page %u err=%d",
+                 (unsigned)page, (int)err);
+        return NULL;
+    }
+#endif
+
+    if (++rom_cache_clock == 0) {
+        for (uint32_t j = 0; j < ROM_CACHE_SLOTS; ++j)
+            rom_cache_age[j] = 0;
+        rom_cache_clock = 1;
+    }
+    rom_cache_tag[slot] = (uint16_t)page;
+    rom_cache_age[slot] = rom_cache_clock;
+    rom_cache_valid[slot] = true;
+    if (page < ROM_CACHE_MAX_PAGES)
+        rom_page_slot[page] = (uint8_t)slot;
     return rom_cache_data[slot];
 }
 
@@ -86,6 +164,10 @@ static inline uint8_t rom_read_byte(Emu *e, uint32_t off)
 
     if (rom_chip_erased)
         return 0xFFu;
+
+    // Optional in-memory ROM path; SD/Flash targets use the page cache.
+    if (e->rom)
+        return e->rom[off];
 
     uint8_t *page = rom_cache_page(e, off);
     if (!page)
@@ -104,6 +186,8 @@ static inline uint16_t rom_read16_cached(Emu *e, uint32_t off)
         sec < ROM_OVERLAY_MAX_SECTORS &&
         !rom_overlay[sec] &&
         in <= ROM_CACHE_PAGE_SIZE - 2u) {
+        if (e->rom)
+            return (uint16_t)(e->rom[off] | ((uint16_t)e->rom[off + 1] << 8));
         uint8_t *p = rom_cache_page(e, off);
         if (p)
             return (uint16_t)(p[in] | ((uint16_t)p[in + 1] << 8));
@@ -123,6 +207,11 @@ static inline uint32_t rom_read32_cached(Emu *e, uint32_t off)
         sec < ROM_OVERLAY_MAX_SECTORS &&
         !rom_overlay[sec] &&
         in <= ROM_CACHE_PAGE_SIZE - 4u) {
+        if (e->rom)
+            return (uint32_t)e->rom[off] |
+                   ((uint32_t)e->rom[off + 1] << 8) |
+                   ((uint32_t)e->rom[off + 2] << 16) |
+                   ((uint32_t)e->rom[off + 3] << 24);
         uint8_t *p = rom_cache_page(e, off);
         if (p)
             return (uint32_t)p[in] |
@@ -157,9 +246,11 @@ static uint8_t *rom_overlay_sector(Emu *e, uint32_t off)
         }
 
         uint32_t base = sec * ROM_OVERLAY_SECTOR_SIZE;
-        if (rom_chip_erased)
+        if (rom_chip_erased) {
             memset(p, 0xFF, ROM_OVERLAY_SECTOR_SIZE);
-        else {
+        } else if (e->rom) {
+            memcpy(p, e->rom + base, ROM_OVERLAY_SECTOR_SIZE);
+        } else {
             uint8_t *src = rom_cache_page(e, base);
             if (!src) {
                 free(p);
