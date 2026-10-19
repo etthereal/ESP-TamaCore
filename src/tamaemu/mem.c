@@ -3,6 +3,11 @@
 #include <esp32-hal-psram.h>
 #include <esp_partition.h>
 
+#if defined(TAMA_ROM_FROM_SD)
+/* Implemented by the Arduino frontend; reads exact byte ranges from the open SD ROM. */
+extern int tama_rom_storage_read(uint32_t offset, uint8_t *dst, size_t len);
+#endif
+
 #define DEV const DeviceProfile *dev = &e->dev
 
 #define ROM_OVERLAY_SECTOR_SIZE 0x10000u
@@ -15,7 +20,9 @@ static uint8_t *rom_overlay[ROM_OVERLAY_MAX_SECTORS];
 static uint32_t rom_overlay_count;
 static bool rom_chip_erased;
 
+#if !defined(TAMA_ROM_FROM_SD)
 static const esp_partition_t *rom_partition;
+#endif
 static uint8_t *rom_cache_data[ROM_CACHE_SLOTS];
 static uint16_t rom_cache_tag[ROM_CACHE_SLOTS];
 static bool rom_cache_valid[ROM_CACHE_SLOTS];
@@ -26,6 +33,7 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
     uint32_t page = off / ROM_CACHE_PAGE_SIZE;
     uint32_t slot = page & (ROM_CACHE_SLOTS - 1u);
 
+#if !defined(TAMA_ROM_FROM_SD)
     if (!rom_partition) {
         rom_partition = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA,
@@ -40,6 +48,7 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
             return NULL;
         }
     }
+#endif
 
     if (!rom_cache_data[slot]) {
         rom_cache_data[slot] = (uint8_t *)ps_malloc(ROM_CACHE_PAGE_SIZE);
@@ -54,6 +63,17 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
     }
 
     if (!rom_cache_valid[slot] || rom_cache_tag[slot] != page) {
+#if defined(TAMA_ROM_FROM_SD)
+        if (tama_rom_storage_read(page * ROM_CACHE_PAGE_SIZE,
+                                  rom_cache_data[slot],
+                                  ROM_CACHE_PAGE_SIZE) != 0) {
+            e->stopped = true;
+            snprintf(e->stop_reason, sizeof e->stop_reason,
+                     "SD ROM cache read failed page %u",
+                     (unsigned)page);
+            return NULL;
+        }
+#else
         esp_err_t err = esp_partition_read(
             rom_partition,
             page * ROM_CACHE_PAGE_SIZE,
@@ -68,6 +88,7 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
                      (unsigned)page, (int)err);
             return NULL;
         }
+#endif
 
         rom_cache_tag[slot] = (uint16_t)page;
         rom_cache_valid[slot] = true;
@@ -87,8 +108,7 @@ static inline uint8_t rom_read_byte(Emu *e, uint32_t off)
     if (rom_chip_erased)
         return 0xFFu;
 
-    // Plus Color target: full ROM is resident in PSRAM; keep the flash-cache
-    // path for the existing P's environment.
+    // Optional in-memory ROM path; SD/Flash targets use the page cache.
     if (e->rom)
         return e->rom[off];
 
