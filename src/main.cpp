@@ -57,7 +57,7 @@
 //
 // The guest ROM is flashed separately into the "tamarom" partition at
 // 0x310000. Keeping it outside firmware.bin avoids an 8+ MiB application
-// image during boot and lets the ESP32 map the ROM directly from Flash.
+// image during boot and lets the emulator read it through a small PSRAM page cache.
 // ============================================================================
 
 static const esp_partition_t *rom_partition = nullptr;
