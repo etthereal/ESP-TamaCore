@@ -87,6 +87,11 @@ static inline uint8_t rom_read_byte(Emu *e, uint32_t off)
     if (rom_chip_erased)
         return 0xFFu;
 
+    // Plus Color target: full ROM is resident in PSRAM; keep the flash-cache
+    // path for the existing P's environment.
+    if (e->rom)
+        return e->rom[off];
+
     uint8_t *page = rom_cache_page(e, off);
     if (!page)
         return 0xFFu;
@@ -104,6 +109,8 @@ static inline uint16_t rom_read16_cached(Emu *e, uint32_t off)
         sec < ROM_OVERLAY_MAX_SECTORS &&
         !rom_overlay[sec] &&
         in <= ROM_CACHE_PAGE_SIZE - 2u) {
+        if (e->rom)
+            return (uint16_t)(e->rom[off] | ((uint16_t)e->rom[off + 1] << 8));
         uint8_t *p = rom_cache_page(e, off);
         if (p)
             return (uint16_t)(p[in] | ((uint16_t)p[in + 1] << 8));
@@ -123,6 +130,11 @@ static inline uint32_t rom_read32_cached(Emu *e, uint32_t off)
         sec < ROM_OVERLAY_MAX_SECTORS &&
         !rom_overlay[sec] &&
         in <= ROM_CACHE_PAGE_SIZE - 4u) {
+        if (e->rom)
+            return (uint32_t)e->rom[off] |
+                   ((uint32_t)e->rom[off + 1] << 8) |
+                   ((uint32_t)e->rom[off + 2] << 16) |
+                   ((uint32_t)e->rom[off + 3] << 24);
         uint8_t *p = rom_cache_page(e, off);
         if (p)
             return (uint32_t)p[in] |
@@ -157,9 +169,11 @@ static uint8_t *rom_overlay_sector(Emu *e, uint32_t off)
         }
 
         uint32_t base = sec * ROM_OVERLAY_SECTOR_SIZE;
-        if (rom_chip_erased)
+        if (rom_chip_erased) {
             memset(p, 0xFF, ROM_OVERLAY_SECTOR_SIZE);
-        else {
+        } else if (e->rom) {
+            memcpy(p, e->rom + base, ROM_OVERLAY_SECTOR_SIZE);
+        } else {
             uint8_t *src = rom_cache_page(e, base);
             if (!src) {
                 free(p);
