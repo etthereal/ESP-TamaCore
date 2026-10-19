@@ -25,13 +25,24 @@ static const esp_partition_t *rom_partition;
 #endif
 static uint8_t *rom_cache_data[ROM_CACHE_SLOTS];
 static uint16_t rom_cache_tag[ROM_CACHE_SLOTS];
+static uint32_t rom_cache_age[ROM_CACHE_SLOTS];
+static uint32_t rom_cache_clock;
 static bool rom_cache_valid[ROM_CACHE_SLOTS];
 
+/*
+ * Fully associative LRU cache instead of a direct-mapped cache.
+ *
+ * SD-backed ROM has much higher miss latency than the Paradise's mapped flash.
+ * A direct-mapped cache can repeatedly evict two hot pages that happen to map
+ * to the same slot. Searching 32 tags is cheap compared with a 64 KiB SD read
+ * and avoids that pathological thrashing without consuming more PSRAM.
+ */
 static uint8_t *rom_cache_page(Emu *e, uint32_t off)
 {
     off &= (e->dev.rom_size - 1u);
     uint32_t page = off / ROM_CACHE_PAGE_SIZE;
-    uint32_t slot = page & (ROM_CACHE_SLOTS - 1u);
+    uint32_t slot = ROM_CACHE_SLOTS;
+    uint32_t oldest_age = UINT32_MAX;
 
 #if !defined(TAMA_ROM_FROM_SD)
     if (!rom_partition) {
@@ -50,6 +61,29 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
     }
 #endif
 
+    /* Cache hit: update recency and return the resident page. */
+    for (uint32_t i = 0; i < ROM_CACHE_SLOTS; ++i) {
+        if (rom_cache_valid[i] && rom_cache_tag[i] == page) {
+            if (++rom_cache_clock == 0) {
+                /* Avoid age-order ambiguity after the counter wraps. */
+                for (uint32_t j = 0; j < ROM_CACHE_SLOTS; ++j)
+                    rom_cache_age[j] = 0;
+                rom_cache_clock = 1;
+            }
+            rom_cache_age[i] = rom_cache_clock;
+            return rom_cache_data[i];
+        }
+        if (!rom_cache_valid[i]) {
+            if (slot == ROM_CACHE_SLOTS) slot = i;
+        } else if (slot == ROM_CACHE_SLOTS &&
+                   rom_cache_age[i] < oldest_age) {
+            oldest_age = rom_cache_age[i];
+            slot = i;
+        }
+    }
+
+    if (slot == ROM_CACHE_SLOTS) slot = 0;
+
     if (!rom_cache_data[slot]) {
         rom_cache_data[slot] = (uint8_t *)ps_malloc(ROM_CACHE_PAGE_SIZE);
         if (!rom_cache_data[slot]) {
@@ -59,41 +93,43 @@ static uint8_t *rom_cache_page(Emu *e, uint32_t off)
                      (unsigned)slot);
             return NULL;
         }
-        rom_cache_valid[slot] = false;
     }
 
-    if (!rom_cache_valid[slot] || rom_cache_tag[slot] != page) {
 #if defined(TAMA_ROM_FROM_SD)
-        if (tama_rom_storage_read(page * ROM_CACHE_PAGE_SIZE,
-                                  rom_cache_data[slot],
-                                  ROM_CACHE_PAGE_SIZE) != 0) {
-            e->stopped = true;
-            snprintf(e->stop_reason, sizeof e->stop_reason,
-                     "SD ROM cache read failed page %u",
-                     (unsigned)page);
-            return NULL;
-        }
+    if (tama_rom_storage_read(page * ROM_CACHE_PAGE_SIZE,
+                              rom_cache_data[slot],
+                              ROM_CACHE_PAGE_SIZE) != 0) {
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "SD ROM cache read failed page %u",
+                 (unsigned)page);
+        return NULL;
+    }
 #else
-        esp_err_t err = esp_partition_read(
-            rom_partition,
-            page * ROM_CACHE_PAGE_SIZE,
-            rom_cache_data[slot],
-            ROM_CACHE_PAGE_SIZE
-        );
+    esp_err_t err = esp_partition_read(
+        rom_partition,
+        page * ROM_CACHE_PAGE_SIZE,
+        rom_cache_data[slot],
+        ROM_CACHE_PAGE_SIZE
+    );
 
-        if (err != ESP_OK) {
-            e->stopped = true;
-            snprintf(e->stop_reason, sizeof e->stop_reason,
-                     "ROM cache read failed page %u err=%d",
-                     (unsigned)page, (int)err);
-            return NULL;
-        }
+    if (err != ESP_OK) {
+        e->stopped = true;
+        snprintf(e->stop_reason, sizeof e->stop_reason,
+                 "ROM cache read failed page %u err=%d",
+                 (unsigned)page, (int)err);
+        return NULL;
+    }
 #endif
 
-        rom_cache_tag[slot] = (uint16_t)page;
-        rom_cache_valid[slot] = true;
+    if (++rom_cache_clock == 0) {
+        for (uint32_t j = 0; j < ROM_CACHE_SLOTS; ++j)
+            rom_cache_age[j] = 0;
+        rom_cache_clock = 1;
     }
-
+    rom_cache_tag[slot] = (uint16_t)page;
+    rom_cache_age[slot] = rom_cache_clock;
+    rom_cache_valid[slot] = true;
     return rom_cache_data[slot];
 }
 
